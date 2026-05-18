@@ -1,0 +1,21 @@
+path: E:/program/Dataset/VisDrone
+train: E:/program/DCAS-master/DCAS-master/ultralytics/datasets/generated/visdrone_smoke/train.txt
+val: E:/program/DCAS-master/DCAS-master/ultralytics/datasets/generated/visdrone_smoke/val.txt
+test: null
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor
+scene_names:
+- scene_0
+- scene_1
+- scene_2
+- scene_3
+scene_labels: E:/program/DCAS-master/DCAS-master/ultralytics/datasets/generated/visdrone_smoke/scene_labels.txt

@@ -1,0 +1,4 @@
+E:/program/Dataset/VisDrone/images/train/0000001_02999_d_0000005.jpg
+E:/program/Dataset/VisDrone/images/train/0000001_03499_d_0000006.jpg
+E:/program/Dataset/VisDrone/images/train/0000001_03999_d_0000007.jpg
+E:/program/Dataset/VisDrone/images/train/0000001_04527_d_0000008.jpg

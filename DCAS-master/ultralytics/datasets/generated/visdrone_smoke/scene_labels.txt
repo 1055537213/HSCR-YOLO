@@ -1,0 +1,6 @@
+images/train/0000001_02999_d_0000005.jpg,scene_0
+images/train/0000001_03499_d_0000006.jpg,scene_0
+images/train/0000001_03999_d_0000007.jpg,scene_0
+images/train/0000001_04527_d_0000008.jpg,scene_0
+images/val/0000006_00159_d_0000001.jpg,scene_2
+images/val/0000006_00611_d_0000002.jpg,scene_2
