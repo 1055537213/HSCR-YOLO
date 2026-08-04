@@ -1,0 +1,18 @@
+# VisDrone detection dataset in YOLO format.
+# Update `path` on the server if your dataset is stored elsewhere.
+path: /root/autodl-tmp/Datasets/VisDrone
+train: images/train
+val: images/val
+test:
+
+names:
+  0: pedestrian
+  1: people
+  2: bicycle
+  3: car
+  4: van
+  5: truck
+  6: tricycle
+  7: awning-tricycle
+  8: bus
+  9: motor
