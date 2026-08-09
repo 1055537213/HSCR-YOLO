@@ -2,7 +2,9 @@
 
 一个面向 VisDrone 小目标检测的 YOLO11 实验仓库。
 
-当前主线是 **HSCR-YOLO**（High-level Semantic Context Retention YOLO），核心思路是保留 P5 语义上下文，但最终只在 P2 / P3 / P4 上做检测，兼顾小目标效果和训练效率。
+当前基线是 **HSCR-YOLO**（High-level Semantic Context Retention YOLO），核心思路是保留 P5 语义上下文，但最终只在 P2 / P3 / P4 上做检测，兼顾小目标效果和训练效率。
+
+仓库新增了待验证的 **GSDR-YOLO**（Geometry-Supervised Dual Routing YOLO）实验分支：在 HSCR 的 P2 / P3 / P4 检测特征前加入几何监督的尺度-密度双路由模块。该分支尚未产生正式训练结果，HSCR 仍是当前对照基线。
 
 ## 1. 项目概述
 
@@ -13,7 +15,24 @@
 - 控制训练时长和显存开销
 - 保留清晰的消融路径，便于后续论文写作和结果对比
 
-当前仓库保留了多个实验分支，包括纯 YOLO11l、P2、RFCG 和 HSCR 等版本，便于回溯和对照。
+当前仓库保留了多个实验分支，包括纯 YOLO11l、P2、RFCG、HSCR 和 GSDR 等版本，便于回溯和对照。
+
+### GSDR 核心机制
+
+GSDR 先利用 P2 预测局部密度图与尺度图，再按以下顺序处理最终检测特征：
+
+1. 密度路由选择小、中、大三种局部观察范围，密集区域偏向较小范围。
+2. 尺度路由在相邻特征层间分配信息，小目标偏向 P2，较大目标增加 P3/P4 比例。
+3. 路由结果以残差方式加入原 P2/P3/P4 特征，再送入 Detect。
+
+核心特征更新可写为：
+
+\[
+F'_l = F_l + \alpha \sum_{j\in\mathcal{N}(l)} \pi_{l\leftarrow j}(\hat{s})
+\mathcal{A}_{j\rightarrow l}\left(\sum_k \beta_k(\hat{d})\mathcal{C}_k(F_j)\right)
+\]
+
+其中，\(\hat{s}\) 为预测尺度，\(\hat{d}\) 为预测密度，\(\pi\) 是跨层路由权重，\(\beta\) 是观察范围权重。训练时在原检测损失外增加密度和尺度辅助损失，但不新增分类损失。
 
 ## 2. 技术栈
 
@@ -31,7 +50,9 @@ flowchart TD
     A[configs/VisDrone.yaml<br/>数据集配置] --> B[scripts/train_*.py<br/>训练入口]
     B --> C[ultralytics/cfg/models/11/*.yaml<br/>模型结构]
     C --> D[ultralytics/nn/tasks.py<br/>模型解析与模块注册]
-    D --> E[ultralytics/nn/modules/conv.py<br/>自定义模块]
+    D --> E[ultralytics/nn/modules/<br/>自定义模块]
+    E --> H[gsdr.py<br/>GSDR 路由与目标图生成]
+    D --> I[ultralytics/utils/loss.py<br/>GSDR 几何辅助损失]
     B --> F[runs/train/VisDrone/<br/>训练输出]
     G[weights/yolo11l.pt<br/>可选本地预训练权重] --> B
 ```
@@ -51,6 +72,7 @@ YOLOv11-VisDrone/
     train_yolo11l_p2_visdrone.py
     train_yolo11l_p2_rfcg_visdrone.py
     train_yolo11l_hscr_visdrone.py
+    train_yolo11l_gsdr_visdrone.py
     val_yolo11l_visdrone.py
   ultralytics/
     cfg/models/11/
@@ -58,9 +80,13 @@ YOLOv11-VisDrone/
       yolo11l-p2.yaml
       yolo11l-p2-rfcg.yaml
       yolo11l-hscr.yaml
+      yolo11l-gsdr.yaml
     nn/
       tasks.py
       modules/conv.py
+      modules/gsdr.py
+  tests/
+    test_gsdr.py
   weights/
     .gitkeep
   requirements.txt
@@ -94,6 +120,10 @@ YOLOv11-VisDrone/
 - [scripts/train_yolo11l_hscr_visdrone.py](scripts/train_yolo11l_hscr_visdrone.py)
   - 当前主线实验入口
 
+- [scripts/train_yolo11l_gsdr_visdrone.py](scripts/train_yolo11l_gsdr_visdrone.py)
+  - GSDR-YOLO 实验入口
+  - 默认保持 `imgsz=832`、`batch=6`，按 `mAP50` 保存最佳权重
+
 - [scripts/val_yolo11l_visdrone.py](scripts/val_yolo11l_visdrone.py)
   - 统一验证入口
 
@@ -112,11 +142,25 @@ YOLOv11-VisDrone/
   - 当前主线 HSCR-YOLO
   - 保留 P5 语义上下文，检测层为 P2 / P3 / P4
 
+- [ultralytics/cfg/models/11/yolo11l-gsdr.yaml](ultralytics/cfg/models/11/yolo11l-gsdr.yaml)
+  - HSCR-YOLO 上的 GSDR 消融结构
+  - GSDR 同时接收最终 P2 / P3 / P4 特征，再交给 Detect
+
 ### 5.3 核心实现
 
 - [ultralytics/nn/modules/conv.py](ultralytics/nn/modules/conv.py)
   - 自定义模块实现位置
   - 当前包含 `CBAM`、`RFCG` 等模块
+
+- [ultralytics/nn/modules/gsdr.py](ultralytics/nn/modules/gsdr.py)
+  - `GSDR` 模块实现
+  - 使用 P2 预测密度图和尺度图
+  - 密度选择局部观察范围，尺度选择 P2 / P3 / P4 的相邻层融合比例
+  - 含 VisDrone 标注统计初始化的有序路由中心和几何目标图生成器
+
+- [ultralytics/utils/loss.py](ultralytics/utils/loss.py)
+  - `GSDRDetectionLoss` 在原检测损失上增加密度损失和尺度损失
+  - 不增加额外分类损失
 
 - [ultralytics/nn/tasks.py](ultralytics/nn/tasks.py)
   - 模型构建、模块注册和结构解析
@@ -154,6 +198,14 @@ python scripts/train_yolo11l_p2_visdrone.py --device 0
 python scripts/train_yolo11l_hscr_visdrone.py --device 0
 ```
 
+GSDR-YOLO：
+
+```bash
+python scripts/train_yolo11l_gsdr_visdrone.py --device 0
+```
+
+GSDR 首轮实验的默认目标是保持 `batch=6`，并记录 `gsdr_density_loss`、`gsdr_scale_loss`、训练时间和显存变化，和 HSCR 基线进行对照。
+
 如果本地有 `weights/yolo11l.pt`，脚本会优先使用；没有的话会自动走 Ultralytics 的默认预训练加载方式。
 
 ### 6.4 验证
@@ -166,5 +218,5 @@ python scripts/val_yolo11l_visdrone.py --device 0
 
 - 只提交代码、配置和文档
 - 不提交训练结果、预训练权重和缓存目录
-- 后续新增模块时，优先改 `ultralytics/nn/modules/conv.py` 和 `ultralytics/nn/tasks.py`
+- 后续新增模块时，优先在 `ultralytics/nn/modules/` 下新建独立模块文件，再在 `ultralytics/nn/tasks.py` 中注册
 - 新实验尽量保持一个脚本对应一个结构，方便做消融对比

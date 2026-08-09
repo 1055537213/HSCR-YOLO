@@ -48,6 +48,7 @@ from ultralytics.nn.modules import (
     DWConv,
     DWConvTranspose2d,
     Focus,
+    GSDR,
     GhostBottleneck,
     GhostConv,
     HGBlock,
@@ -79,6 +80,7 @@ from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, SAFE_LOAD, SETTINGS, WIN
 from ultralytics.utils.checks import REMOTE_FILE_PREFIXES, check_file, check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
     E2ELoss,
+    GSDRDetectionLoss,
     PoseLoss26,
     SemanticSegmentationLoss,
     v8ClassificationLoss,
@@ -400,6 +402,7 @@ class DetectionModel(BaseModel):
         """
         super().__init__()
         _initialize_yolo_model(self, cfg, ch, nc, verbose)
+        self.has_gsdr = any(isinstance(module, GSDR) for module in self.model.modules())
 
         # Build strides
         m = self.model[-1]  # Detect()
@@ -518,6 +521,8 @@ class DetectionModel(BaseModel):
 
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
+        if self.has_gsdr:
+            return GSDRDetectionLoss(self)
         return E2ELoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
 
 
@@ -1890,6 +1895,11 @@ def parse_model(d, ch, verbose=True):
                 raise ValueError(f"RFCG expects exactly two input layers, but got from={f}.")
             c2 = ch[f[0]]
             args = [ch[f[0]], ch[f[1]], *args]
+        elif m is GSDR:
+            if not isinstance(f, (list, tuple)) or len(f) != 3:
+                raise ValueError(f"GSDR expects exactly three input layers (P2, P3, P4), but got from={f}.")
+            c2 = [ch[x] for x in f]
+            args = [c2, *args]
         elif m in frozenset(
             {
                 Detect,
@@ -1905,7 +1915,12 @@ def parse_model(d, ch, verbose=True):
                 OBB26,
             }
         ):
-            args.extend([reg_max, end2end, [ch[x] for x in f]])
+            input_channels = (
+                ch[f]
+                if isinstance(f, int) and isinstance(ch[f], (list, tuple))
+                else [ch[x] for x in f]
+            )
+            args.extend([reg_max, end2end, input_channels])
             if m is Segment or m is YOLOESegment or m is Segment26 or m is YOLOESegment26:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
             if m in {Detect, YOLOEDetect, Segment, Segment26, YOLOESegment, YOLOESegment26, Pose, Pose26, OBB, OBB26}:

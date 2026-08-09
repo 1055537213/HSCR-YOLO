@@ -472,6 +472,64 @@ class v8DetectionLoss:
         return loss * batch_size, loss_detach
 
 
+class GSDRDetectionLoss(v8DetectionLoss):
+    """YOLO detection loss extended with geometry supervision for a GSDR module."""
+
+    def __init__(self, model: torch.nn.Module, tal_topk: int = 10, tal_topk2: int | None = None):
+        super().__init__(model, tal_topk, tal_topk2)
+        from ultralytics.nn.modules.gsdr import GSDR
+
+        self.gsdr = next((module for module in model.modules() if isinstance(module, GSDR)), None)
+        if self.gsdr is None:
+            raise ValueError("GSDRDetectionLoss requires a GSDR module in the model.")
+        self.density_gain = float(getattr(model.args, "gsdr_density_gain", 0.2))
+        self.scale_gain = float(getattr(model.args, "gsdr_scale_gain", 0.1))
+
+    def _geometry_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Calculate density and scale losses from the transformed training boxes."""
+        aux = self.gsdr.last_aux
+        if not aux:
+            zero = preds["boxes"].sum() * 0.0
+            return zero, zero
+
+        from ultralytics.nn.modules.gsdr import build_gsdr_targets
+
+        target_size = aux["density"].shape[-2:]
+        density_target, scale_target, scale_mask = build_gsdr_targets(
+            batch_idx=batch["batch_idx"],
+            boxes=batch["bboxes"],
+            batch_size=preds["boxes"].shape[0],
+            output_size=target_size,
+            kernel=self.gsdr.target_kernel,
+            density_temperature=self.gsdr.density_temperature,
+        )
+        density_prediction = aux["density"].float()
+        scale_prediction = aux["scale"].float()
+        density_target = density_target.to(dtype=density_prediction.dtype)
+        scale_target = scale_target.to(dtype=scale_prediction.dtype)
+        scale_mask = scale_mask.to(dtype=scale_prediction.dtype)
+
+        density_error = F.smooth_l1_loss(density_prediction, density_target, reduction="none")
+        density_weight = 1.0 + 4.0 * density_target
+        density_loss = (density_error * density_weight).sum() / density_weight.sum().clamp_min(1.0)
+
+        scale_error = F.smooth_l1_loss(scale_prediction, scale_target, reduction="none")
+        scale_loss = (scale_error * scale_mask).sum() / scale_mask.sum().clamp_min(1.0)
+        return density_loss, scale_loss
+
+    def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return detection plus geometry losses while keeping each component separately observable."""
+        detection_loss, detection_items = super().loss(preds, batch)
+        density_loss, scale_loss = self._geometry_loss(preds, batch)
+        ramp = self.gsdr.warmup_factor()
+        density_item = density_loss * self.density_gain * ramp
+        scale_item = scale_loss * self.scale_gain * ramp
+        geometry_items = torch.stack((density_item, scale_item))
+        total_loss = torch.cat((detection_loss, geometry_items * preds["boxes"].shape[0]))
+        loss_items = torch.cat((detection_items, geometry_items.detach()))
+        return total_loss, loss_items
+
+
 class v8SegmentationLoss(v8DetectionLoss):
     """Criterion class for computing training losses for YOLOv8 segmentation."""
 

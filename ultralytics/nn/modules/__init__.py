@@ -77,6 +77,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
+from .gsdr import GSDR
 from .head import (
     OBB,
     OBB26,
@@ -157,6 +158,7 @@ __all__ = (
     "Focus",
     "GhostBottleneck",
     "GhostConv",
+    "GSDR",
     "HGBlock",
     "HGStem",
     "ImagePoolingAttn",
