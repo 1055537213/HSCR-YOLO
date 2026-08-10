@@ -1,4 +1,5 @@
 import unittest
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +44,19 @@ class GSDRTargetTests(unittest.TestCase):
 
 
 class GSDRModuleTests(unittest.TestCase):
+    def test_eval_forward_is_ema_deepcopy_safe(self):
+        """ModelEMA copies the model after the construction-time eval forward pass."""
+        module = GSDR([8, 16, 32], hidden_channels=8).eval()
+        features = [
+            torch.randn(1, 8, 16, 16),
+            torch.randn(1, 16, 8, 8),
+            torch.randn(1, 32, 4, 4),
+        ]
+
+        module(features)
+        deepcopy(module)
+        self.assertIsNone(module.last_aux)
+
     def test_routing_preserves_feature_shapes_and_gradients(self):
         module = GSDR([8, 16, 32], hidden_channels=8, warmup_epochs=3)
         module.train()

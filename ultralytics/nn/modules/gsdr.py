@@ -200,7 +200,9 @@ class GSDR(nn.Module):
         prior = self.prior_head(self.prior_stem(features[0]))
         density_map = prior[:, 0:1].sigmoid()
         scale_map = prior[:, 1:2].sigmoid()
-        self.last_aux = {"density": density_map, "scale": scale_map}
+        # Model construction and inference run this module in eval mode before ModelEMA deep-copies the network.
+        # Keep autograd-connected auxiliary maps only for the immediately following training loss calculation.
+        self.last_aux = {"density": density_map, "scale": scale_map} if self.training else None
 
         scale_centers = _ordered_centers(self.scale_gap_logits).to(dtype=scale_map.dtype)
         density_centers = _ordered_centers(self.density_gap_logits).flip(0).to(dtype=density_map.dtype)
