@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>从一张航拍图理解 CNN、DWConv、SGD、AMP 与 Mosaic</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <h1>从一张航拍图理解训练全过程</h1>
+  <p class="lead">目标：能够结合 YOLO11l-VisDrone 项目，准确解释 CNN Backbone、DWConv、SGD、AMP 和 Mosaic 各自做了什么。</p>
+
+  <div class="flow" aria-label="训练数据流">
+    <div class="step"><strong>1. Mosaic</strong>训练时概率性地拼接 4 张图</div>
+    <div class="step"><strong>2. Backbone</strong>逐层提取细节和语义特征</div>
+    <div class="step"><strong>3. GSDR</strong>DWConv 多感受野处理 P2</div>
+    <div class="step"><strong>4. Loss</strong>计算预测与标签之间的误差</div>
+    <div class="step"><strong>5. SGD + AMP</strong>稳定、高效地更新参数</div>
+  </div>
+
+  <h2>CNN Backbone：图像特征加工流水线</h2>
+  <p>Backbone 是检测器前半部分。输入不是直接交给检测头，而是经过多层卷积，把 RGB 像素逐渐变成边缘、纹理、局部形状和目标语义。YOLO11l 的 Backbone 生成 P2/P3/P4/P5 等不同尺度特征；层越浅，空间分辨率越高，层越深，观察范围和语义越强。</p>
+  <p>以 640×640 输入为例，P2 约为 160×160，P3 为 80×80，P4 为 40×40，P5 为 20×20。HSCR 保留 P5 语义并增加 P2 检测，使小行人在下采样后仍有更多格点表示。</p>
+
+  <h2>DWConv：先在每个通道内观察空间</h2>
+  <p>普通卷积同时混合空间位置和所有通道，计算较重。Depthwise convolution 给每个输入通道各用一个卷积核，只处理本通道的空间关系；项目随后用 1×1 Conv 再混合通道。若输入输出都是 64 通道、核为 3×3，普通卷积约需 64×64×9=36,864 个核参数，而 depthwise 只需 64×9=576 个，后接 1×1 卷积也明显更轻。</p>
+  <p>GSDR 对 P2 使用 dilation=1/2/3 三条 DWConv 分支。同样是 3×3 核，dilation 越大，采样点间隔越大：有效感受野分别约为 3×3、5×5、7×7。它改变的是“看多大范围”，不是把原图直接放大。</p>
+
+  <h2>SGD：根据错误方向小步修改参数</h2>
+  <p>一次迭代中，模型先预测，再由检测损失和 GSDR 辅助损失得到总误差；反向传播计算每个参数怎样变化能让误差下降，SGD 再沿这个方向更新参数。当前脚本使用初始学习率 0.01、momentum 0.937、weight decay 0.0005，并启用 Nesterov。</p>
+  <ul>
+    <li>学习率控制每一步走多远。</li>
+    <li>Momentum 累积近期方向，减少来回摆动。</li>
+    <li>Weight decay 抑制权重无限变大，帮助泛化。</li>
+  </ul>
+
+  <h2>AMP：让适合的运算用半精度</h2>
+  <p><code>autocast</code> 在前向计算中自动让大量卷积使用 FP16，而数值敏感操作保留更高精度。随后 <code>GradScaler</code> 先放大 loss 再反向传播，避免很小的 FP16 梯度直接变成 0；更新前恢复梯度，若发现 Inf/NaN 就跳过这次更新并调整缩放倍数。AMP 改变数值表示和速度，不等于减少训练数据或直接提高精度。</p>
+
+  <h2>Mosaic：把四个训练场景临时拼成一个</h2>
+  <p>每次取当前图片和另外 3 张训练图，缩放后放到随机中心的四个区域，同时平移、裁剪并重新计算所有边界框。项目设置 <code>mosaic=0.3</code>，表示每个训练样本约有 30% 概率走 Mosaic；不是把数据集永久改写，也不是每轮必用。</p>
+  <p>Mosaic 让一张训练图同时出现更多目标、不同尺度和裁剪情况，尤其契合 VisDrone 的小目标和密集场景。项目设置 <code>close_mosaic=10</code>，最后 10 个 epoch 关闭它，让模型回到自然图像分布上稳定收敛。</p>
+
+  <div class="note"><strong>不要混淆：</strong>Backbone 是网络结构；DWConv 是卷积算子；SGD 是参数更新方法；AMP 是计算精度与速度策略；Mosaic 是训练数据增强。五者处在不同环节。</div>
+
+  <section class="quiz">
+    <h2>一分钟自测</h2>
+    <ol>
+      <li>为什么加入 P2 有利于小目标，而保留 P5 仍然重要？</li>
+      <li>DWConv 的 dilation=3 是否代表卷积核变成 7×7？</li>
+      <li>AMP 为什么需要 GradScaler？</li>
+      <li>mosaic=0.3 和 close_mosaic=10 分别控制什么？</li>
+    </ol>
+    <p>先不看材料口头回答，再向 Codex 提问并校正不确定的部分。</p>
+  </section>
+
+  <h2>主要参考</h2>
+  <p><a href="https://docs.pytorch.org/docs/stable/generated/torch.optim.SGD.html">PyTorch SGD</a> · <a href="https://docs.pytorch.org/docs/stable/notes/amp_examples.html">PyTorch AMP</a> · <a href="https://arxiv.org/abs/1704.04861">MobileNets</a> · <a href="https://docs.ultralytics.com/guides/yolo-data-augmentation/">Ultralytics 数据增强</a></p>
+</main>
+</body>
+</html>

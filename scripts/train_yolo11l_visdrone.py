@@ -27,15 +27,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch", type=int, default=16)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--device", default="0")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--project", type=Path, default=REPO_ROOT / "runs" / "train" / "VisDrone")
-    parser.add_argument("--name", default="yolo11l-visdrone")
+    parser.add_argument("--name", default="yolo11l-visdrone-img640")
     parser.add_argument("--optimizer", default="SGD")
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mosaic", type=float, default=0.3)
     parser.add_argument("--close-mosaic", type=int, default=10)
     parser.add_argument("--patience", type=int, default=40)
     parser.add_argument("--save-period", type=int, default=-1)
+    parser.add_argument("--fitness-metric", choices=("map50", "map50-95"), default="map50-95")
     parser.add_argument("--cache", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
@@ -43,6 +45,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    run_directory = args.project / args.name
+    if run_directory.exists():
+        raise FileExistsError(f"Run directory already exists: {run_directory}. Choose a new --name.")
     model = YOLO(args.model)
     train_args = {
         "data": str(args.data.resolve()),
@@ -50,6 +55,8 @@ def main() -> None:
         "batch": args.batch,
         "imgsz": args.imgsz,
         "device": args.device,
+        "seed": args.seed,
+        "deterministic": True,
         "workers": args.workers,
         "project": str(args.project),
         "name": args.name,
@@ -59,9 +66,10 @@ def main() -> None:
         "close_mosaic": args.close_mosaic,
         "patience": args.patience,
         "save_period": args.save_period,
+        "fitness_metric": args.fitness_metric,
         "cache": args.cache,
         "amp": args.amp,
-        "exist_ok": True,
+        "exist_ok": False,
         "verbose": True,
     }
     print("Training YOLO11l with arguments:")

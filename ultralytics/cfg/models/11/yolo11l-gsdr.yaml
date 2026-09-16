@@ -1,4 +1,4 @@
-# GSDR-YOLO: HSCR-YOLO11l with Geometry-Supervised Dual Routing before Detect.
+# GSDR-YOLO-v6: HSCR-YOLO11l with scale-aware calibrated routing and raw-density residual gating.
 # P5 backbone context is retained; Detect consumes routed P2/P3/P4 features.
 
 scale: l
@@ -46,5 +46,5 @@ head:
   - [[-1, 13], 1, Concat, [1]] # cat head P4
   - [-1, 2, C3k2, [512, False]] # 25 (P4/16-medium)
 
-  - [[19, 22, 25], 1, GSDR, [64, 0.15, 0.25, 3.0, 2.0]] # 26 routed P2/P3/P4
+  - [[19, 22, 25], 1, GSDR, [64, 0.15, 0.15, 10.0, 2.0, 0.05, 0.30, False, False, True]] # 26 v6 P2 route
   - [-1, 1, Detect, [nc]] # Detect(GSDR-P2, GSDR-P3, GSDR-P4)

@@ -11,10 +11,10 @@ import torch.nn.functional as F
 from .conv import Conv, DWConv
 
 
-# Statistics computed from the VisDrone training labels (381,963 boxes).
+# Scale statistics computed from the VisDrone training labels (381,963 boxes).
 GSDR_SCALE_MEAN = -3.808831
 GSDR_SCALE_STD = 0.750130
-GSDR_SCALE_CENTERS = (0.334, 0.493, 0.666)
+# Branch centers operate on density after calibration to the unit routing interval.
 GSDR_DENSITY_CENTERS = (0.25, 0.48, 0.67)
 
 
@@ -102,16 +102,22 @@ def _ordered_centers(logits: torch.Tensor) -> torch.Tensor:
 
 
 class GSDR(nn.Module):
-    """Geometry-Supervised Dual Routing for final P2/P3/P4 detection features."""
+    """Foreground-gated density-scale routing for P2 while passing P3/P4 through unchanged."""
 
     def __init__(
         self,
         channels: Sequence[int],
         hidden_channels: int = 64,
         routing_temperature: float = 0.15,
-        alpha_max: float = 0.25,
-        warmup_epochs: float = 3.0,
+        alpha_max: float = 0.15,
+        warmup_epochs: float = 10.0,
         density_temperature: float = 2.0,
+        density_route_floor: float = 0.05,
+        density_route_ceiling: float = 0.30,
+        calibrate_residual_gate: bool = False,
+        detach_density_for_routing: bool = False,
+        use_scale_for_routing: bool = False,
+        uniform_routing: bool = False,
     ):
         super().__init__()
         if len(channels) != 3:
@@ -120,6 +126,8 @@ class GSDR(nn.Module):
             raise ValueError("GSDR channel counts must be positive and hidden_channels must be >= 8.")
         if routing_temperature <= 0 or alpha_max < 0 or warmup_epochs < 0 or density_temperature <= 0:
             raise ValueError("GSDR routing, residual, warmup, or density settings are invalid.")
+        if not 0 <= density_route_floor < density_route_ceiling <= 1:
+            raise ValueError("GSDR density routing bounds must satisfy 0 <= floor < ceiling <= 1.")
 
         self.channels = tuple(int(c) for c in channels)
         self.hidden_channels = int(hidden_channels)
@@ -127,22 +135,23 @@ class GSDR(nn.Module):
         self.alpha_max = float(alpha_max)
         self.warmup_epochs = float(warmup_epochs)
         self.density_temperature = float(density_temperature)
+        self.density_route_floor = float(density_route_floor)
+        self.density_route_ceiling = float(density_route_ceiling)
+        self.calibrate_residual_gate = bool(calibrate_residual_gate)
+        self.detach_density_for_routing = bool(detach_density_for_routing)
+        self.use_scale_for_routing = bool(use_scale_for_routing)
+        self.uniform_routing = bool(uniform_routing)
         self.current_epoch = 0.0
 
-        self.in_proj = nn.ModuleList(Conv(c, hidden_channels, 1, 1) for c in self.channels)
-        self.context_branches = nn.ModuleList(
-            nn.ModuleList(
-                nn.Sequential(
-                    DWConv(hidden_channels, hidden_channels, 3, 1, d=dilation),
-                    Conv(hidden_channels, hidden_channels, 1, 1),
-                )
-                for dilation in (1, 2, 3)
+        self.p2_in_proj = Conv(self.channels[0], hidden_channels, 1, 1)
+        self.p2_context_branches = nn.ModuleList(
+            nn.Sequential(
+                DWConv(hidden_channels, hidden_channels, 3, 1, d=dilation),
+                Conv(hidden_channels, hidden_channels, 1, 1),
             )
-            for _ in self.channels
+            for dilation in (1, 2, 3)
         )
-        self.out_proj = nn.ModuleList(
-            Conv(hidden_channels, c, 1, 1, act=False) for c in self.channels
-        )
+        self.p2_out_proj = Conv(hidden_channels, self.channels[0], 1, 1, act=False)
 
         prior_channels = max(16, min(hidden_channels, 32))
         self.prior_stem = Conv(self.channels[0], prior_channels, 3, 1)
@@ -150,20 +159,34 @@ class GSDR(nn.Module):
         nn.init.constant_(self.prior_head.bias[0], -3.0)
         nn.init.constant_(self.prior_head.bias[1], 0.0)
 
-        scale_gaps = torch.tensor(
-            [GSDR_SCALE_CENTERS[0], GSDR_SCALE_CENTERS[1] - GSDR_SCALE_CENTERS[0],
-             GSDR_SCALE_CENTERS[2] - GSDR_SCALE_CENTERS[1], 1.0 - GSDR_SCALE_CENTERS[2]],
-            dtype=torch.float32,
-        )
         density_gaps = torch.tensor(
-            [GSDR_DENSITY_CENTERS[0], GSDR_DENSITY_CENTERS[1] - GSDR_DENSITY_CENTERS[0],
-             GSDR_DENSITY_CENTERS[2] - GSDR_DENSITY_CENTERS[1], 1.0 - GSDR_DENSITY_CENTERS[2]],
+            [
+                GSDR_DENSITY_CENTERS[0],
+                GSDR_DENSITY_CENTERS[1] - GSDR_DENSITY_CENTERS[0],
+                GSDR_DENSITY_CENTERS[2] - GSDR_DENSITY_CENTERS[1],
+                1.0 - GSDR_DENSITY_CENTERS[2],
+            ],
             dtype=torch.float32,
         )
-        self.scale_gap_logits = nn.Parameter(scale_gaps.log())
         self.density_gap_logits = nn.Parameter(density_gaps.log())
-        self.residual_logits = nn.Parameter(torch.full((3,), -4.0))
+        # Keep the residual small at initialization while leaving enough gradient for the routed branch to learn.
+        self.residual_logits = nn.Parameter(torch.tensor([-1.5], dtype=torch.float32))
         self.register_buffer("target_kernel", make_gsdr_gaussian_kernel(), persistent=False)
+        diagnostic_buffers = {
+            "_diag_route_soft_sum": torch.zeros(3),
+            "_diag_route_hard_count": torch.zeros(3),
+            "_diag_positive_hard_count": torch.zeros(3),
+            "_diag_negative_hard_count": torch.zeros(3),
+            "_diag_gate_sum": torch.zeros(1),
+            "_diag_pixel_count": torch.zeros(1),
+            "_diag_positive_count": torch.zeros(1),
+            "_diag_negative_count": torch.zeros(1),
+            "_diag_delta_square_sum": torch.zeros(1),
+            "_diag_p2_square_sum": torch.zeros(1),
+        }
+        self._diagnostic_buffer_names = tuple(diagnostic_buffers)
+        for name, value in diagnostic_buffers.items():
+            self.register_buffer(name, value, persistent=False)
         self.last_aux: dict[str, torch.Tensor] | None = None
 
     def set_epoch(self, epoch: int | float) -> None:
@@ -179,15 +202,139 @@ class GSDR(nn.Module):
         """Return the current residual and geometry-loss warmup factor."""
         return self._warmup_factor()
 
+    def consume_aux(self) -> dict[str, torch.Tensor] | None:
+        """Return the latest training-only auxiliary maps and release their retained computation graph."""
+        aux, self.last_aux = self.last_aux, None
+        return aux
+
     def _route(self, value: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
         distances = (value - centers.view(1, -1, 1, 1)).square()
         return torch.softmax(-distances / (2 * self.routing_temperature**2), dim=1)
 
-    def _align(self, feature: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
-        if feature.shape[-2:] == size:
-            return feature
-        mode = "nearest" if feature.shape[-2] < size[0] else "area"
-        return F.interpolate(feature, size=size, mode=mode)
+    def calibrate_density(self, density: torch.Tensor) -> torch.Tensor:
+        """Map supervised density values onto the full routing interval."""
+        floor = getattr(self, "density_route_floor", None)
+        ceiling = getattr(self, "density_route_ceiling", None)
+        if floor is None or ceiling is None:
+            return density  # Legacy v2 checkpoints keep their original uncalibrated routing behavior.
+        return ((density - floor) / (ceiling - floor)).clamp(0, 1)
+
+    def routing_signal(self, density: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+        """Return the calibrated geometry signal used to select context branches."""
+        routing_density = self.calibrate_density(density)
+        if not getattr(self, "use_scale_for_routing", False):
+            return routing_density
+        if scale is None:
+            raise ValueError("Scale-aware GSDR routing requires a scale map.")
+        if scale.shape != density.shape:
+            raise ValueError("GSDR density and scale maps must have identical shapes for scale-aware routing.")
+
+        # Density confidence controls how strongly inverse object scale shifts foreground routing. Background stays at
+        # zero, while small objects move toward dilation 1 and large objects move toward dilations 2-3.
+        inverse_scale = 1.0 - scale.clamp(0, 1)
+        return (routing_density + routing_density * inverse_scale) / (1.0 + routing_density)
+
+    def routing_weights(self, density: torch.Tensor, scale: torch.Tensor | None = None) -> torch.Tensor:
+        """Return branch weights from the configured density or density-scale routing signal."""
+        if getattr(self, "uniform_routing", False):
+            # Keep all three context branches active while removing spatially adaptive branch selection.
+            return density.new_full((density.shape[0], 3, *density.shape[-2:]), 1.0 / 3.0)
+        routing_signal = self.routing_signal(density, scale)
+        route_centers = _ordered_centers(self.density_gap_logits).flip(0).to(dtype=density.dtype)
+        return self._route(routing_signal, route_centers)
+
+    def routing_input(self, density: torch.Tensor) -> torch.Tensor:
+        """Detach v5 routing density while leaving legacy checkpoint gradients unchanged."""
+        if getattr(self, "detach_density_for_routing", False):
+            return density.detach()
+        return density
+
+    def residual_gate(self, density: torch.Tensor) -> torch.Tensor:
+        """Return raw-density gating for v4+ while preserving legacy v3 checkpoint behavior."""
+        if getattr(self, "calibrate_residual_gate", True):
+            return self.calibrate_density(density)
+        return density
+
+    @torch.no_grad()
+    def _record_forward_diagnostics(
+        self,
+        route_weights: torch.Tensor,
+        residual_gate: torch.Tensor,
+        p2: torch.Tensor,
+        routed_p2: torch.Tensor,
+    ) -> None:
+        """Accumulate device-side routing statistics without synchronizing each batch."""
+        route_weights = route_weights.detach().float()
+        hard_route = route_weights.argmax(dim=1)
+        hard_count = torch.stack([(hard_route == index).sum() for index in range(3)]).to(dtype=torch.float32)
+        delta = routed_p2.detach().float() - p2.detach().float()
+
+        self._diag_route_soft_sum.add_(route_weights.sum(dim=(0, 2, 3)))
+        self._diag_route_hard_count.add_(hard_count)
+        self._diag_gate_sum.add_(residual_gate.detach().float().sum())
+        self._diag_pixel_count.add_(residual_gate.numel())
+        self._diag_delta_square_sum.add_(delta.square().sum())
+        self._diag_p2_square_sum.add_(p2.detach().float().square().sum())
+
+    @torch.no_grad()
+    def record_target_diagnostics(
+        self,
+        route_weights: torch.Tensor,
+        density_target: torch.Tensor,
+        positive_threshold: float,
+    ) -> None:
+        """Accumulate target-conditioned branch usage for the current training epoch."""
+        if route_weights.shape[0] != density_target.shape[0] or route_weights.shape[-2:] != density_target.shape[-2:]:
+            raise ValueError("GSDR route weights and density targets must share batch and spatial dimensions.")
+        hard_route = route_weights.detach().argmax(dim=1)
+        positive = density_target.detach().squeeze(1) >= positive_threshold
+        negative = ~positive
+        positive_count = torch.stack([((hard_route == index) & positive).sum() for index in range(3)]).float()
+        negative_count = torch.stack([((hard_route == index) & negative).sum() for index in range(3)]).float()
+
+        self._diag_positive_hard_count.add_(positive_count)
+        self._diag_negative_hard_count.add_(negative_count)
+        self._diag_positive_count.add_(positive.sum())
+        self._diag_negative_count.add_(negative.sum())
+
+    @torch.no_grad()
+    def reset_diagnostics(self) -> None:
+        """Clear accumulated routing statistics before a new epoch."""
+        for name in self._diagnostic_buffer_names:
+            getattr(self, name).zero_()
+
+    @torch.no_grad()
+    def consume_diagnostics(self) -> dict[str, float]:
+        """Return epoch routing statistics as host scalars and reset their accumulators."""
+        pixel_count = float(self._diag_pixel_count.item())
+        if pixel_count == 0:
+            return {}
+
+        positive_count = float(self._diag_positive_count.item())
+        negative_count = float(self._diag_negative_count.item())
+        route_soft = (self._diag_route_soft_sum / pixel_count).cpu().tolist()
+        route_hard = (self._diag_route_hard_count / pixel_count).cpu().tolist()
+        positive_hard = (self._diag_positive_hard_count / max(positive_count, 1.0)).cpu().tolist()
+        negative_hard = (self._diag_negative_hard_count / max(negative_count, 1.0)).cpu().tolist()
+        centers = _ordered_centers(self.density_gap_logits.detach()).flip(0).cpu().tolist()
+        p2_delta_rms_ratio = torch.sqrt(
+            self._diag_delta_square_sum / self._diag_p2_square_sum.clamp_min(1e-12)
+        ).item()
+        diagnostics = {
+            "residual_gate_mean": float((self._diag_gate_sum / pixel_count).item()),
+            "p2_delta_rms_ratio": float(p2_delta_rms_ratio),
+            "positive_fraction": positive_count / max(positive_count + negative_count, 1.0),
+            "effective_alpha": float(self.alpha_max * torch.sigmoid(self.residual_logits[0]) * self.warmup_factor()),
+        }
+        for index in range(3):
+            dilation = index + 1
+            diagnostics[f"route_soft_d{dilation}"] = float(route_soft[index])
+            diagnostics[f"route_hard_d{dilation}"] = float(route_hard[index])
+            diagnostics[f"positive_hard_d{dilation}"] = float(positive_hard[index])
+            diagnostics[f"negative_hard_d{dilation}"] = float(negative_hard[index])
+            diagnostics[f"route_center_d{dilation}"] = float(centers[index])
+        self.reset_diagnostics()
+        return diagnostics
 
     def forward(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
         """Return routed P2/P3/P4 features while retaining auxiliary prior predictions."""
@@ -196,39 +343,25 @@ class GSDR(nn.Module):
         if any(feature.ndim != 4 for feature in features):
             raise ValueError("Each GSDR feature map must have shape [B, C, H, W].")
 
-        projected = [projection(feature) for projection, feature in zip(self.in_proj, features)]
-        prior = self.prior_head(self.prior_stem(features[0]))
+        p2, p3, p4 = features
+        p2_projected = self.p2_in_proj(p2)
+        prior = self.prior_head(self.prior_stem(p2))
         density_map = prior[:, 0:1].sigmoid()
         scale_map = prior[:, 1:2].sigmoid()
+        route_weights = self.routing_weights(self.routing_input(density_map), scale_map)
+        residual_gate = self.residual_gate(density_map)
         # Model construction and inference run this module in eval mode before ModelEMA deep-copies the network.
         # Keep autograd-connected auxiliary maps only for the immediately following training loss calculation.
-        self.last_aux = {"density": density_map, "scale": scale_map} if self.training else None
+        self.last_aux = (
+            {"density": density_map, "scale": scale_map, "route_weights": route_weights} if self.training else None
+        )
+        weights = route_weights.split(1, dim=1)
+        p2_context = weights[0] * self.p2_context_branches[0](p2_projected)
+        for index, branch in enumerate(self.p2_context_branches[1:], start=1):
+            p2_context = p2_context + weights[index] * branch(p2_projected)
 
-        scale_centers = _ordered_centers(self.scale_gap_logits).to(dtype=scale_map.dtype)
-        density_centers = _ordered_centers(self.density_gap_logits).flip(0).to(dtype=density_map.dtype)
-        scale_weights = self._route(scale_map, scale_centers)
-
-        context_features = []
-        for level, (feature, branches) in enumerate(zip(projected, self.context_branches)):
-            level_density = F.interpolate(density_map, size=feature.shape[-2:], mode="bilinear", align_corners=False)
-            density_weights = self._route(level_density, density_centers)
-            context = sum(
-                weight * branch(feature)
-                for weight, branch in zip(density_weights.split(1, dim=1), branches)
-            )
-            context_features.append(context)
-
-        routed = []
-        for level, (original, output_projection) in enumerate(zip(features, self.out_proj)):
-            target_size = projected[level].shape[-2:]
-            neighbors = range(max(0, level - 1), min(3, level + 2))
-            level_weights = F.interpolate(scale_weights, size=target_size, mode="bilinear", align_corners=False)
-            selected_weights = torch.stack([level_weights[:, source] for source in neighbors], dim=1)
-            selected_weights = selected_weights / selected_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
-            fused = sum(
-                weight.unsqueeze(1) * self._align(context_features[source], target_size)
-                for weight, source in zip(selected_weights.unbind(1), neighbors)
-            )
-            alpha = self.alpha_max * torch.sigmoid(self.residual_logits[level]) * self.warmup_factor()
-            routed.append(original + alpha * output_projection(fused))
-        return routed
+        alpha = self.alpha_max * torch.sigmoid(self.residual_logits[0]) * self.warmup_factor()
+        routed_p2 = p2 + alpha * residual_gate * self.p2_out_proj(p2_context)
+        if self.training:
+            self._record_forward_diagnostics(route_weights, residual_gate, p2, routed_p2)
+        return [routed_p2, p3, p4]

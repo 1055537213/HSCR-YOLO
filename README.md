@@ -122,7 +122,7 @@ YOLOv11-VisDrone/
 
 - [scripts/train_yolo11l_gsdr_visdrone.py](scripts/train_yolo11l_gsdr_visdrone.py)
   - GSDR-YOLO 实验入口
-  - 默认保持 `imgsz=832`、`batch=6`，按 `mAP50` 保存最佳权重
+  - 默认使用 v4 均匀路由消融，`imgsz=640`、`batch=8`，按 `mAP50-95` 保存最佳权重，与已完成的 HSCR-640 对齐
 
 - [scripts/val_yolo11l_visdrone.py](scripts/val_yolo11l_visdrone.py)
   - 统一验证入口
@@ -204,7 +204,11 @@ GSDR-YOLO：
 python scripts/train_yolo11l_gsdr_visdrone.py --device 0
 ```
 
-GSDR 首轮实验的默认目标是保持 `batch=6`，并记录 `gsdr_density_loss`、`gsdr_scale_loss`、训练时间和显存变化，和 HSCR 基线进行对照。
+后续训练和验证统一使用 `imgsz=640`。已完成的 HSCR-640 实际使用 `batch=8`，其最佳权重 mAP50 为 0.40748、mAP50-95 为 0.23748。HSCR/GSDR 入口默认 `batch=8`、`seed=0`，按 `mAP50-95` 选择最佳权重及早停。旧 832 结果仅作历史参考，不能用于这组模块增益对照。
+
+现在先跑 GSDR v4 均匀路由，再跑 v4 动态路由，与已有 HSCR 对照。GSDR 默认入口已切换到均匀路由；v6 配置保留供历史复现，不安排重跑。显式命令及判定标准见 [GSDR_ABLATION.md](GSDR_ABLATION.md)。记录辅助损失、训练时间和显存变化。P2/P2-RFCG 旧入口只统一了分辨率，若加入正式对照还需显式统一 batch 等设置。
+
+已有 YOLO11l-640 使用 `batch=16`，入口保留该默认值。这组结果暂作历史参考，不要求现在重跑；与 batch=8 的 HSCR 比较不能隔离 batch 的影响。候选模块通过筛选后，再补同 batch 的 YOLO11l 对照及重复实验。主线入口拒绝已存在的实验目录，复跑或切换模型、种子请指定新的 `--name`。
 
 如果本地有 `weights/yolo11l.pt`，脚本会优先使用；没有的话会自动走 Ultralytics 的默认预训练加载方式。
 

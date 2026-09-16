@@ -33,3 +33,4 @@ weights/*.pt
 Thumbs.db
 
 _vendor_downloads/
+tmp/

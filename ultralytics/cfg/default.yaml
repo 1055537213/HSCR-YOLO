@@ -38,8 +38,10 @@ profile: False # (bool) profile ONNX/TensorRT speeds during training for loggers
 freeze: # (int | list, optional) freeze first N layers (int) or specific layer indices (list)
 multi_scale: 0.0 # (float) multi-scale range as a fraction of imgsz; sizes are rounded to stride multiples
 compile: False # (bool | str) enable torch.compile() backend='inductor'; True="default", False=off, or "default|reduce-overhead|max-autotune-no-cudagraphs"
-gsdr_density_gain: 0.2 # (float) GSDR density auxiliary-loss gain; used only by GSDR models
-gsdr_scale_gain: 0.1 # (float) GSDR scale auxiliary-loss gain; used only by GSDR models
+gsdr_density_gain: 0.1 # (float) GSDR density auxiliary-loss gain; used only by GSDR models
+gsdr_scale_gain: 0.05 # (float) GSDR scale auxiliary-loss gain; used only by GSDR models
+gsdr_density_positive_threshold: 0.05 # (float) density target threshold for foreground pixels; used only by GSDR models
+gsdr_density_hard_negative_ratio: 3.0 # (float) exponent controlling hard-negative focus; used only by GSDR models
 
 # Segmentation
 overlap_mask: True # (bool) merge instance masks into one mask during training (segment only)

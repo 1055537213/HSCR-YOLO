@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>如何判断小目标漏检来自哪里</title>
+  <link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+<main>
+  <h1>如何判断小目标漏检来自哪里</h1>
+  <p class="lead">目标：区分“支持一个诊断假设”和“已经排除其他原因”，并准确说明当前 VisDrone 项目的证据强度。</p>
+
+  <h2>当前可以成立的证据链</h2>
+  <ol>
+    <li>定性检查中，漏检集中出现在尺寸小、目标密集和遮挡明显的区域，提出空间细节不足的假设。</li>
+    <li>基线训练与验证曲线已经进入平台期，继续训练不再明显提高指标，说明问题不像单纯训练轮数不足。</li>
+    <li>640 输入的 YOLO11l 提升到 832 后，mAP50 从 0.38992 上升到 0.43294，说明保留更多输入细节对任务很重要。</li>
+    <li>加入 P2/HSCR 后，640 实验的 mAP50 从 0.38992 上升到 0.40748，mAP50-95 从 0.22922 上升到 0.23748；最低置信度附近的全类 Recall 约从 0.61 上升到 0.63。</li>
+    <li>验证数据、NMS IoU=0.7 和 max_det=300 没变，且 mAP 不是单一置信度点，因此结果支持“候选特征变好”，而不只是手动改了显示阈值。</li>
+  </ol>
+
+  <div class="note"><strong>结论边界：</strong>这些结果支持把特征表达不足列为主要优化方向，但还没有证明它是唯一或核心根因。历史实验存在 batch 和输入尺寸差异，仓库中也没有按目标尺寸统计 AP/Recall 或保存完整的 pre-NMS 候选召回分析。</div>
+
+  <h2>四类原因怎样真正区分</h2>
+  <table>
+    <thead><tr><th>可能原因</th><th>应该看的证据</th><th>当前状态</th></tr></thead>
+    <tbody>
+      <tr><td>数据分布</td><td>小/中/大框占比、类别频次、遮挡与截断分层指标</td><td>同一数据集被控制，但尚未被排除</td></tr>
+      <tr><td>训练策略</td><td>同结构下学习率、batch、增强和训练时长的单变量对照</td><td>曲线已收敛，但没有完整策略消融</td></tr>
+      <tr><td>后处理</td><td>pre-NMS Recall、conf/NMS IoU/max_det 扫描</td><td>参数相同，尚未做系统扫描</td></tr>
+      <tr><td>特征表达</td><td>固定其他条件后，P2只对小目标Recall/AP产生稳定提升</td><td>已有总体指标支持，缺尺寸分桶与多种子确认</td></tr>
+    </tbody>
+  </table>
+
+  <h2>面试中的严谨表达</h2>
+  <p>不要说“我已经证明核心原因就是特征表达不足”。更准确的是：“Bad Case 主要集中在小而密集的目标，基线曲线已经收敛；提高输入分辨率和引入 P2 后 Recall 与两项 mAP 同时提升，所以我将高分辨率特征表达不足确定为优先验证的主要假设。由于早期实验的 batch 不完全一致，我没有把它描述为唯一根因，后续继续用统一 640 设置、尺寸分桶和路由消融补齐证据。”</p>
+
+  <section class="quiz">
+    <h2>一分钟自测</h2>
+    <ol>
+      <li>同一数据集训练能否证明数据分布没有问题？</li>
+      <li>为什么 mAP 提升比只看某个 confidence 下的 Recall 更有说服力？</li>
+      <li>什么结果能把后处理问题和候选特征问题区分开？</li>
+    </ol>
+    <p>先口头回答，再向 Codex 提问并校正证据边界。返回<a href="0001-cnn-dwconv-sgd-amp-mosaic.html">上一课：训练全过程</a>。</p>
+  </section>
+
+  <h2>项目证据</h2>
+  <p><a href="../../runs/train/VisDrone/yolo11l-visdrone-img640/results.png">YOLO11l-640训练曲线</a> · <a href="../../runs/train/VisDrone/yolo11l-hscr-visdrone-img640/results.png">HSCR-640训练曲线</a> · <a href="../GSDR_ABLATION.md">GSDR消融协议</a></p>
+</main>
+</body>
+</html>

@@ -473,7 +473,7 @@ class v8DetectionLoss:
 
 
 class GSDRDetectionLoss(v8DetectionLoss):
-    """YOLO detection loss extended with geometry supervision for a GSDR module."""
+    """YOLO detection loss extended with foreground-balanced geometry supervision for a GSDR module."""
 
     def __init__(self, model: torch.nn.Module, tal_topk: int = 10, tal_topk2: int | None = None):
         super().__init__(model, tal_topk, tal_topk2)
@@ -482,13 +482,36 @@ class GSDRDetectionLoss(v8DetectionLoss):
         self.gsdr = next((module for module in model.modules() if isinstance(module, GSDR)), None)
         if self.gsdr is None:
             raise ValueError("GSDRDetectionLoss requires a GSDR module in the model.")
-        self.density_gain = float(getattr(model.args, "gsdr_density_gain", 0.2))
-        self.scale_gain = float(getattr(model.args, "gsdr_scale_gain", 0.1))
+        self.density_gain = float(getattr(model.args, "gsdr_density_gain", 0.1))
+        self.scale_gain = float(getattr(model.args, "gsdr_scale_gain", 0.05))
+        self.density_positive_threshold = float(getattr(model.args, "gsdr_density_positive_threshold", 0.05))
+        self.density_hard_negative_ratio = float(getattr(model.args, "gsdr_density_hard_negative_ratio", 3.0))
+        if self.density_gain < 0 or self.scale_gain < 0:
+            raise ValueError("GSDR auxiliary-loss gains must be non-negative.")
+        if not 0 <= self.density_positive_threshold <= 1:
+            raise ValueError("GSDR density positive threshold must be between 0 and 1.")
+        if self.density_hard_negative_ratio < 0:
+            raise ValueError("GSDR hard-negative focus must be non-negative.")
+
+    def _balanced_density_loss(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Balance foreground pixels against hard negatives with a GPU-native error-focused weighting."""
+        density_error = F.smooth_l1_loss(prediction, target, reduction="none")
+        positive_mask = target >= self.density_positive_threshold
+
+        positive_weight = positive_mask.to(dtype=density_error.dtype)
+        positive_loss = (density_error * positive_weight).sum() / positive_weight.sum().clamp_min(1.0)
+
+        negative_weight = (~positive_mask).to(dtype=density_error.dtype)
+        negative_focus = density_error.detach().pow(self.density_hard_negative_ratio)
+        focused_negative_weight = negative_weight * negative_focus
+        hard_negative_loss = (density_error * focused_negative_weight).sum() / focused_negative_weight.sum().clamp_min(1e-6)
+
+        return positive_loss + 0.25 * hard_negative_loss
 
     def _geometry_loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate density and scale losses from the transformed training boxes."""
-        aux = self.gsdr.last_aux
-        if not aux:
+        aux = self.gsdr.consume_aux()
+        if aux is None:
             zero = preds["boxes"].sum() * 0.0
             return zero, zero
 
@@ -503,15 +526,16 @@ class GSDRDetectionLoss(v8DetectionLoss):
             kernel=self.gsdr.target_kernel,
             density_temperature=self.gsdr.density_temperature,
         )
+        self.gsdr.record_target_diagnostics(
+            aux["route_weights"], density_target, positive_threshold=self.density_positive_threshold
+        )
         density_prediction = aux["density"].float()
         scale_prediction = aux["scale"].float()
         density_target = density_target.to(dtype=density_prediction.dtype)
         scale_target = scale_target.to(dtype=scale_prediction.dtype)
         scale_mask = scale_mask.to(dtype=scale_prediction.dtype)
 
-        density_error = F.smooth_l1_loss(density_prediction, density_target, reduction="none")
-        density_weight = 1.0 + 4.0 * density_target
-        density_loss = (density_error * density_weight).sum() / density_weight.sum().clamp_min(1.0)
+        density_loss = self._balanced_density_loss(density_prediction, density_target)
 
         scale_error = F.smooth_l1_loss(scale_prediction, scale_target, reduction="none")
         scale_loss = (scale_error * scale_mask).sum() / scale_mask.sum().clamp_min(1.0)

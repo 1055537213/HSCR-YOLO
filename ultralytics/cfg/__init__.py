@@ -183,6 +183,9 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "gsdr_density_gain",
+        "gsdr_scale_gain",
+        "gsdr_density_hard_negative_ratio",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -210,6 +213,7 @@ CFG_FRACTION_KEYS = frozenset(
         "iou",
         "fraction",
         "multi_scale",
+        "gsdr_density_positive_threshold",
     }
 )
 CFG_INT_KEYS = frozenset(
